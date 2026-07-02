@@ -1,0 +1,14 @@
+{
+  "name": "torn-fix-time-sync",
+  "version": "1.1.0",
+  "private": true,
+  "description": "NTP-style time sync userscript for Torn (Tampermonkey + Torn PDA)",
+  "scripts": {
+    "test": "bun test",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write ."
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.2"
+  }
+}

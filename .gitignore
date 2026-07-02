@@ -1,0 +1,9 @@
+# Dependencies
+node_modules/
+
+# Jujutsu (colocated repo metadata)
+.jj/
+
+# Logs and OS cruft
+*.log
+.DS_Store

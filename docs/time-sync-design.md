@@ -66,7 +66,9 @@ resolution). Larger ones (first sync, wake-from-sleep) Step immediately.
 ### D6. Poll Interval: adaptive 2min → 20min backoff
 Our sampler internally rate-limits regardless of how often Sync Triggers fire. Interval
 doubles each time a fresh Sample agrees with the Filtered Offset within ~50ms, capped at
-20 min; resets toward 2 min when dispersion rises. Steady state ≈3–4 requests/hour vs
+20 min; halves toward 2 min when dispersion rises (halving, not resetting: persistent
+disagreement reaches the floor within a few Samples, but one noisy Sample can't collapse
+a 20-minute backoff — found by a fixed-seed test). Steady state ≈3–4 requests/hour vs
 today's 30.
 
 Refinement found in simulation: a disagreeing Sample only resets backoff when its RTT is
