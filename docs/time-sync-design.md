@@ -28,7 +28,7 @@ injection order relative to base.js, and has no `GM_*` APIs — so the script mu
 self-contained (plain `fetch`, no GM calls) and must not assume `serverTimeService`
 exists yet: it polls for `window.serverTimeService` (~250ms interval, ~30s give-up)
 before patching. PDA's webview is suspended aggressively on mobile, making the
-Burst-on-visibility rule (D3) load-bearing there.
+Timebase Anomaly recovery (D11) load-bearing there.
 
 ### D2. Patch surface: two instance-level interceptions
 1. `serverTimeService.syncTimeWithServer = ourSampler` — every existing Sync Trigger
@@ -46,8 +46,11 @@ and leave native behavior untouched.
 
 ### D3. Local Timebase: `performance.now()`
 `Date.now()` steps when the OS adjusts the wall clock, corrupting a stored Offset.
-`performance.now()` is monotonic but may pause across system sleep — so a focus or
-visibility event after >60s hidden invalidates the Sample window and triggers a Burst.
+`performance.now()` is monotonic but may pause across system sleep — recovery from that
+is handled by Timebase Anomaly detection (D11), which supersedes the earlier
+"invalidate after 60s hidden" rule: a shift in the `Date.now() − performance.now()`
+delta is a direct, reliable signal that the timebase broke, whereas hidden-duration was
+only a proxy for it.
 
 ### D4. Sampling: same endpoint, four-timestamp math, Clock Filter
 No server changes are possible. Per Sample: `t0` (perf at send), `t3` (perf at receive),
@@ -88,3 +91,43 @@ Constants ship as designed (750ms step/slew, 50ms agreement, 2→20min backoff, 
 window) rather than running a measurement phase first. `window.__timeSync` exposes live
 state (Filtered Offset, RTT, Poll Interval, sample window) and a console-logging toggle
 so the constants can be tuned from real data later.
+
+### D10. Cross-tab sharing: one Wall-Anchored Sample window in localStorage
+People who care about clock sync run multiple tabs; without sharing, every tab Bursts on
+open and every visible window polls independently. Tabs therefore share one Sample
+window under a versioned localStorage key.
+
+- **Wall Anchoring** — a perf-anchored Offset is meaningless in another tab because each
+  tab has its own `performance.timeOrigin`. Samples are stored as
+  `{wallOffset: serverTime − Date.now(), rtt, atWall}` and converted back into the
+  reading tab's perf-anchored form at recompute time. Accepted trade-off: this makes
+  shared Samples sensitive to wall-clock steps, which D11 exists to catch.
+- **No leader election** — hidden tabs already never sample, so coordination reduces to:
+  read-merge the shared window before deciding a Sample is due (a fresh Sample from any
+  tab satisfies every tab), plus a short Attempt Guard (~5s claim with tab id) so two
+  visible windows don't double-sample in a tight race. A rare duplicate request is
+  accepted over lock machinery.
+- **Merging** is deterministic (dedupe by `atWall`+`rtt`, drop >2h old or future-dated,
+  keep newest 8), so all tabs converge to the identical Filtered Offset. Slew stays
+  per-tab: each tab slews from its own displayed value, so adopting a shared target
+  never causes a visible jump anywhere.
+- **Storage events are a nicety, not a dependency** — Torn PDA's multi-tab webviews
+  share localStorage but event delivery between them is unreliable, so every Sync
+  Trigger re-reads the shared window regardless.
+- **Any storage failure (quota, privacy mode, corrupt JSON) degrades silently to
+  per-tab operation** — v1.0.0 behavior.
+
+### D11. Timebase Anomaly recovery (replaces hidden-invalidate; hardened for D10)
+A shift >1s in the `Date.now() − performance.now()` delta means the timebase broke
+(system sleep paused perf, or the wall clock stepped). The naive response — clear
+everything and Burst — is wrong multi-tab: a tab waking from sleep would destroy the
+shared window another tab already rebuilt. Instead, an anomalous tab discards its local
+state, **adopts shared Samples newer than 5 minutes** (probably written post-discontinuity
+by a tab that already recovered), and takes **one verification Sample**; only if no fresh
+shared Samples exist does it clear the shared window and Burst.
+
+The verification Sample is backed by a general self-heal rule: if a credible (low-RTT)
+Sample disagrees with the Filtered Offset by more than 2× the step threshold, the window
+is presumed poisoned (e.g. Samples written just before a wall step) and is rebuilt from
+scratch. This bounds the damage of D10's wall-step sensitivity to roughly one extra
+round-trip.

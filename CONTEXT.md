@@ -40,3 +40,17 @@ backs off while the Filtered Offset is stable and shrinks when dispersion rises.
 **Sync Trigger** — any event that requests a sync: window focus, the periodic timer, or
 page load. Triggers *request* Samples; the Poll Interval decides whether one is actually
 taken.
+
+**Wall Anchoring** — expressing a Sample relative to the shared wall clock (`Date.now()`)
+instead of a tab's private monotonic clock, so the Sample is meaningful in every tab.
+
+**Shared Sample Window** — the single merged window of Wall-Anchored Samples that all
+tabs contribute to and read from. Merging is deterministic, so every tab derives the
+same Filtered Offset from it.
+
+**Attempt Guard** — a short-lived claim a tab records before taking a Sample so that
+concurrently visible tabs don't duplicate the request.
+
+**Timebase Anomaly** — a detected discontinuity between the wall clock and a tab's
+monotonic clock, meaning one of them paused or stepped (system sleep, manual clock
+change). Samples spanning an anomaly cannot be trusted.
