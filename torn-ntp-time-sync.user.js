@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn NTP-Style Time Sync
 // @namespace    https://github.com/xentac/torn_fix_time_sync
-// @version      1.1.0
+// @version      1.1.1
 // @author       xentac [3354782]
 // @description  Replaces Torn's single-sample time sync with an NTP-style clock filter shared across tabs: smoother timers, fewer requests.
 // @match        https://www.torn.com/*
