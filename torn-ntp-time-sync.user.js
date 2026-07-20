@@ -5,7 +5,7 @@
 // @author       xentac [3354782]
 // @description  Replaces Torn's single-sample time sync with an NTP-style clock filter shared across tabs: smoother timers, fewer requests.
 // @match        https://www.torn.com/*
-// @run-at       document-idle
+// @run-at       document-start
 // @grant        none
 // ==/UserScript==
 
