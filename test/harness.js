@@ -74,31 +74,29 @@ export function createWorld({ seed = 1 } = {}) {
     await drain();
   }
 
-  // --- network model: asymmetric latency with occasional spikes
-  let fetchCount = 0;
+  // --- network model: asymmetric latency with occasional spikes. Requests
+  // only exist as Torn's getAction calls; the userscript has no transport.
+  let requestCount = 0;
+  let requestsOutsideTrigger = 0; // requests not caused by a native Sync Trigger
+  let nativeDepth = 0; // >0 while a native Sync Trigger is running
   let badPayloadNext = false;
-  function vFetch() {
-    fetchCount++;
+  function vGetAction(opts) {
+    requestCount++;
+    if (nativeDepth === 0) requestsOutsideTrigger++;
     const up = 20 + rand() * 80 + (rand() < 0.15 ? rand() * 400 : 0);
     const down = 20 + rand() * 80 + (rand() < 0.15 ? rand() * 400 : 0);
     const bad = badPayloadNext;
     badPayloadNext = false;
-    return new Promise((resolve) => {
-      const tServer = trueServerNow() + up; // server stamps after the uplink
-      vSetTimeout(
-        () =>
-          resolve({
-            text: () =>
-              Promise.resolve(
-                bad
-                  ? '{"ok":true}'
-                  : JSON.stringify({ time: Math.round(tServer) }),
-              ),
-          }),
-        up + down,
+    const tServer = trueServerNow() + up; // server stamps after the uplink
+    vSetTimeout(() => {
+      opts.success(
+        bad ? '{"ok":true}' : JSON.stringify({ time: Math.round(tServer) }),
       );
-    });
+    }, up + down);
   }
+  const noFetch = () => {
+    throw new Error("the userscript must not send its own requests");
+  };
 
   // --- shared storage with cross-tab storage events
   const store = new Map();
@@ -133,6 +131,7 @@ export function createWorld({ seed = 1 } = {}) {
       intervalOffset = 0,
       broken = false,
       noService = false,
+      getActionOffWindow = false, // base.js sees getAction, window does not
     } = {},
   ) {
     const tab = { name, storageListeners: [], visListeners: [], hidden: false };
@@ -146,13 +145,49 @@ export function createWorld({ seed = 1 } = {}) {
         if (ev === "visibilitychange") tab.visListeners.push(fn);
       },
     };
-    tab.service = { timeNow: wallNow(), syncTimeWithServer() {} };
     tab.win = {
+      getAction: getActionOffWindow ? undefined : vGetAction,
       addEventListener: (ev, fn) => {
         if (ev === "storage") tab.storageListeners.push(fn);
       },
     };
-    if (!noService) tab.win.serverTimeService = tab.service;
+
+    // ServerTimeService from base.js, minus the jQuery/cookie plumbing. It
+    // resolves getAction from the global object at call time, as base.js does.
+    const service = { timeNow: wallNow() };
+    const getAction = () =>
+      getActionOffWindow ? vGetAction : tab.win.getAction;
+    service.syncTimeWithServer = () => {
+      if (typeof getAction() !== "function") return;
+      if (!/\bisLoggedIn=1\b/.test(tab.doc.cookie)) return;
+      const start = wallNow();
+      getAction()({
+        type: "get",
+        action: `/sidebarAjaxAction.php?action=servertime&t=${start}`,
+        success: (resp) => {
+          try {
+            const data = JSON.parse(resp);
+            const latency = (wallNow() - start) / 2;
+            service.timeNow = data && data.time + latency;
+          } catch (_e) {}
+        },
+      });
+    };
+    tab.service = service;
+    // a native Sync Trigger: base.js calls the method late-bound on the instance
+    const trigger = () => {
+      nativeDepth++;
+      try {
+        tab.service.syncTimeWithServer();
+      } finally {
+        nativeDepth--;
+      }
+    };
+
+    if (!noService) {
+      tab.win.serverTimeService = tab.service;
+      trigger(); // constructor call, before the userscript can patch anything
+    }
 
     new Function(
       "window",
@@ -160,10 +195,10 @@ export function createWorld({ seed = 1 } = {}) {
       "performance",
       "Date",
       "fetch",
+      "XMLHttpRequest",
       "setTimeout",
       "clearTimeout",
       "console",
-      "AbortController",
       "localStorage",
       code,
     )(
@@ -171,23 +206,26 @@ export function createWorld({ seed = 1 } = {}) {
       tab.doc,
       tab.perf,
       DateStub,
-      vFetch,
+      noFetch,
+      noFetch,
       vSetTimeout,
       vClearTimeout,
       console,
-      class {
-        constructor() {
-          this.signal = null;
-        }
-        abort() {}
-      },
       broken ? brokenStorage : makeStorage(tab),
     );
 
     if (!noService) {
-      // native base.js 120s interval
+      // worker tick: timers_web_worker.js posts 'tick' every second
+      const workerTick = () => {
+        tab.service.timeNow += 1000;
+        vSetTimeout(workerTick, 1000);
+      };
+      vSetTimeout(workerTick, 1000);
+      // 20s post-load kick from jQuery(document).ready
+      vSetTimeout(trigger, 20000);
+      // 120s interval, skipped while hidden
       const tick = () => {
-        if (!tab.hidden) tab.service.syncTimeWithServer();
+        if (!tab.hidden) trigger();
         vSetTimeout(tick, 120000);
       };
       vSetTimeout(tick, 120000 + intervalOffset);
@@ -198,7 +236,7 @@ export function createWorld({ seed = 1 } = {}) {
       tab.visListeners.forEach((f) => {
         f();
       });
-      if (!h) tab.service.syncTimeWithServer(); // native focus listener
+      if (!h) trigger(); // native focus listener
     };
     tab.err = () => tab.service.timeNow - trueServerNow();
     tabs.push(tab);
@@ -210,8 +248,11 @@ export function createWorld({ seed = 1 } = {}) {
     makeTab,
     wallNow,
     trueServerNow,
-    get fetchCount() {
-      return fetchCount;
+    get requestCount() {
+      return requestCount;
+    },
+    get requestsOutsideTrigger() {
+      return requestsOutsideTrigger;
     },
     failNextPayload() {
       badPayloadNext = true;

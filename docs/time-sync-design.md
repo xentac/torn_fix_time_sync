@@ -25,7 +25,7 @@ on a malformed-but-truthy response.
 Single `.user.js` that works in both hosts. Tampermonkey: `@run-at document-idle`,
 `@grant none`, page context. Torn PDA's engine ignores most metadata, guarantees no
 injection order relative to base.js, and has no `GM_*` APIs — so the script must be
-self-contained (plain `fetch`, no GM calls) and must not assume `serverTimeService`
+self-contained (no GM calls) and must not assume `serverTimeService`
 exists yet: it polls for `window.serverTimeService` (~250ms interval, ~30s give-up)
 before patching. PDA's webview is suspended aggressively on mobile, making the
 Timebase Anomaly recovery (D11) load-bearing there.
@@ -55,8 +55,8 @@ only a proxy for it.
 ### D4. Sampling: same endpoint, four-timestamp math, Clock Filter
 No server changes are possible. Per Sample: `t0` (perf at send), `t3` (perf at receive),
 `T` (server ms); `rtt = t3 − t0`; Offset candidate `= T + rtt/2` anchored at `t3`. Keep
-the last 8 Samples; the Filtered Offset comes from the minimum-RTT Sample. Startup Burst:
-4 Samples ~1.5s apart. Validate `Number.isFinite(data.time)`. Preserve existing guards:
+the last 8 Samples; the Filtered Offset comes from the minimum-RTT Sample. ~~Startup Burst:
+4 Samples ~1.5s apart.~~ (removed by D12) Validate `Number.isFinite(data.time)`. Preserve existing guards:
 `getAction` exists, `isLoggedIn` cookie is `1`, tab visible.
 
 ### D5. Correction: Slew ≤750ms, Step above
@@ -82,7 +82,7 @@ Regress Offset against Local Timebase across the window to estimate local clock 
 quartz skew ≈ 24ms per 20 min, mostly cancelled). Skip the term with <3 Samples or a
 poor fit.
 
-### D8. Transport: plain `fetch`, not Torn's `getAction`
+### D8. Transport: plain `fetch`, not Torn's `getAction` (superseded by D12)
 `fetch` against the same endpoint with same-origin credentials gives precise `t0`/`t3`
 capture around the request and removes a dependency that may not exist yet when PDA
 injects the script. The native guards are preserved: `isLoggedIn` cookie is `1` and the
@@ -119,7 +119,7 @@ window under a versioned localStorage key.
 - **Any storage failure (quota, privacy mode, corrupt JSON) degrades silently to
   per-tab operation** — v1.0.0 behavior.
 
-### D11. Timebase Anomaly recovery (replaces hidden-invalidate; hardened for D10)
+### D11. Timebase Anomaly recovery (amended by D12) (replaces hidden-invalidate; hardened for D10)
 A shift >1s in the `Date.now() − performance.now()` delta means the timebase broke
 (system sleep paused perf, or the wall clock stepped). The naive response — clear
 everything and Burst — is wrong multi-tab: a tab waking from sleep would destroy the
@@ -133,3 +133,46 @@ Sample disagrees with the Filtered Offset by more than 2× the step threshold, t
 is presumed poisoned (e.g. Samples written just before a wall step) and is rebuilt from
 scratch. This bounds the damage of D10's wall-step sensitivity to roughly one extra
 round-trip.
+
+D12 amendment: the verification Sample and the rebuild no longer send requests
+directly. An anomaly sets a flag, and the next native Sync Trigger lets one request
+through. Because the native focus listener fires on wake, this is usually immediate.
+If nothing fresh exists, the window is cleared and refills one Sample per native
+trigger.
+
+### D12. Gated Pass-Through: the script sends no requests of its own (2026-11-19)
+Torn's rules forbid a script that sends a request on the user's behalf without their
+interaction. D8 broke that rule even though the script sent fewer requests than native
+code. The script now never sends a request. Every request is Torn's own servertime
+request, and the script only decides whether a native Sync Trigger is allowed to send it.
+
+- `syncTimeWithServer` is still replaced (D2). On a native Sync Trigger, if a Sample is
+  due under the Poll Interval and the Attempt Guard, the script calls the saved native
+  `syncTimeWithServer`. Otherwise the trigger does nothing. Suppression keeps the
+  request rate of D6.
+- Observation: during that synchronous native call only, `window.getAction` is replaced
+  with a wrapper and restored in a `finally` block. The wrapper times the servertime
+  request (`t0` at the call, `t3` at `success`), feeds `addSample`, and then calls
+  Torn's `success`. A permanent global patch is not used, because a later
+  `function getAction` declaration would overwrite it. `getAction` is a global function
+  declaration on torn.com, so the property is writable (reported by the user from the
+  desktop source).
+- `getAction` has no error callback, so a failed request cannot be seen. `inFlight`
+  clears after 10s, or on a response.
+- Bursts are removed. The window fills at native cadence. A page load with a fresh
+  shared window (any Sample younger than 2h) is accurate at once. A cold start keeps
+  native behavior until the 20s kick delivers the first Sample.
+- Before the first Sample, writes to `timeNow` are honored, so the native constructor
+  response and the worker tick drive the clock as they do natively. After the first
+  Sample, writes are ignored (D2). Non-finite writes are always ignored.
+- The script's own events (visibility, storage) only merge the shared window and detect
+  anomalies. They never cause a request.
+- The constructor's request runs before the script can patch, as it did before. It is
+  not observed.
+- If `window.getAction` is not a function, the script calls the native function
+  unwrapped. No Sample is ever taken, so every native trigger passes through, and
+  behavior is exactly native.
+- Simulation over 20 seeds: accuracy and request rate stay within the D6 bounds
+  (4h error at most 73ms, at most 10 req/h). Sleep
+  recovery for two tabs uses 2 requests instead of up to 7. No request is sent outside
+  a native Sync Trigger.

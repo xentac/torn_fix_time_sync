@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn NTP-Style Time Sync
 // @namespace    https://github.com/xentac/torn_fix_time_sync
-// @version      1.1.1
+// @version      1.2.0
 // @author       xentac [3354782]
 // @description  Replaces Torn's single-sample time sync with an NTP-style clock filter shared across tabs: smoother timers, fewer requests.
 // @match        https://www.torn.com/*
@@ -14,14 +14,17 @@
 // serverTimeService exists at injection time. All tabs share one Sample window
 // through localStorage (Wall-Anchored, since each tab's performance.timeOrigin
 // differs); any storage failure degrades silently to per-tab operation.
+//
+// The script never sends a request of its own. Samples are taken by observing
+// the servertime request that Torn's own syncTimeWithServer sends through
+// getAction; the script only decides whether a native Sync Trigger is allowed
+// to send that request (Gated Pass-Through, D12).
 
 (() => {
   if (window.__timeSync) return; // double-injection guard (Tampermonkey + PDA)
 
   const CONFIG = {
     windowSize: 8, // Samples kept for the Clock Filter
-    burstCount: 4, // Samples in a Burst
-    burstSpacingMs: 1500,
     minPollMs: 120000, // Poll Interval floor (matches native cadence)
     maxPollMs: 1200000, // Poll Interval cap (20 min)
     agreementMs: 50, // Sample agreeing with prediction within this doubles the Poll Interval
@@ -29,7 +32,7 @@
     slewDurationMs: 30000,
     wallDeltaAnomalyMs: 1000, // Date.now()-performance.now() shift that signals a Timebase Anomaly
     anomalyAdoptMs: 300000, // after an anomaly, shared Samples younger than this are adopted, not discarded
-    fetchTimeoutMs: 10000,
+    responseTimeoutMs: 10000, // getAction has no error callback; give up on a response after this
     skewMinSamples: 3,
     skewMinSpanMs: 300000, // don't trust a skew slope fit over less than 5 min
     skewClamp: 2e-4, // ±200ppm
@@ -50,19 +53,17 @@
   let skewSlope = 0; // ms of offset drift per ms of perf time
   let slewCorrection = null; // {startPerf, amount} — decays to zero over slewDurationMs
   let inFlight = false;
-  let burstRemaining = 0;
+  let inFlightTimer = null;
+  let verifyPending = false; // a Timebase Anomaly wants one Sample at the next native Sync Trigger
   let lastWallPerfDelta = null;
-  let fallbackAnchor = null; // {timeNow, perf} — native clock carried forward until first Sample
+  let nativeTimeNow = 0; // native clock, honored only until the first Sample exists
+  let service = null;
+  let nativeSync = null;
   let storageOk = true; // flips false permanently on the first storage failure
   let logging = false;
 
   function log(...args) {
     if (logging) console.log("[timeSync]", ...args);
-  }
-
-  function getCookie(name) {
-    const r = document.cookie.match(`\\b${name}=([^;]*)\\b`);
-    return r ? r[1] : undefined;
   }
 
   function wallPerfDelta() {
@@ -161,10 +162,7 @@
   function serverNow() {
     const perf = performance.now();
     const offset = offsetValue(perf);
-    if (offset === null) {
-      // No Sample yet: carry the native clock forward from patch time.
-      return Math.round(fallbackAnchor.timeNow + (perf - fallbackAnchor.perf));
-    }
+    if (offset === null) return nativeTimeNow; // no Sample yet: native clock, native semantics
     return Math.round(perf + offset);
   }
 
@@ -223,7 +221,7 @@
   }
 
   function addSample(perfSample) {
-    if (targetOffset !== null && burstRemaining === 0) {
+    if (targetOffset !== null) {
       const predicted = targetValue(perfSample.atPerf);
       const bestRtt = samples.reduce((m, s) => Math.min(m, s.rtt), Infinity);
       const disagreement = Math.abs(perfSample.offset - predicted);
@@ -234,7 +232,7 @@
         log(
           `credible sample disagrees by ${Math.round(disagreement)}ms; rebuilding window`,
         );
-        clearWindowAndBurst();
+        clearWindow();
       } else if (disagreement <= CONFIG.agreementMs) {
         // Adaptive Poll Interval: agreement with the prediction earns backoff.
         pollMs = Math.min(pollMs * 2, CONFIG.maxPollMs);
@@ -265,21 +263,98 @@
   }
 
   // --- sampling ------------------------------------------------------------
-  function takeSample() {
-    let settled = false;
-    function settle() {
-      // continue a Burst exactly once per attempt, taken or skipped
-      if (settled) return;
-      settled = true;
-      if (burstRemaining > 0) {
-        burstRemaining--;
-        if (burstRemaining > 0) setTimeout(takeSample, CONFIG.burstSpacingMs);
-      }
+  function clearInFlight(attempt) {
+    if (inFlight !== attempt) return; // a late response from an older attempt
+    inFlight = false;
+    if (inFlightTimer !== null) clearTimeout(inFlightTimer);
+    inFlightTimer = null;
+  }
+
+  function onServertimeResponse(resp, t0) {
+    const t3 = performance.now();
+    let data = null;
+    try {
+      data = JSON.parse(resp);
+    } catch (_e) {
+      // fall through to the payload check
     }
+    if (!data || !Number.isFinite(data.time)) {
+      log("sample failed: bad servertime payload");
+      return;
+    }
+    const rtt = t3 - t0;
+    addSample({ offset: data.time + rtt / 2 - t3, rtt: rtt, atPerf: t3 });
+  }
 
-    if (inFlight || document.hidden || getCookie("isLoggedIn") !== "1")
-      return settle();
+  // Wraps Torn's getAction for one servertime request: claims the Attempt
+  // Guard, times the request, and observes the response before Torn's own
+  // success handler runs (that handler's timeNow write is then ignored).
+  function observingGetAction(original) {
+    return function (opts, ...rest) {
+      if (
+        !opts ||
+        typeof opts.action !== "string" ||
+        opts.action.indexOf("action=servertime") === -1 ||
+        typeof opts.success !== "function"
+      ) {
+        return original.call(this, opts, ...rest);
+      }
+      const attempt = {};
+      inFlight = attempt;
+      inFlightTimer = setTimeout(() => {
+        clearInFlight(attempt);
+      }, CONFIG.responseTimeoutMs);
+      verifyPending = false;
+      updateShared((o) => {
+        o.attemptAtWall = Date.now();
+        o.attemptBy = tabId;
+      });
+      const nativeSuccess = opts.success;
+      const t0 = performance.now();
+      const observed = Object.assign({}, opts, {
+        success: function (resp, ...more) {
+          clearInFlight(attempt);
+          try {
+            onServertimeResponse(resp, t0);
+          } catch (e) {
+            log("sample failed", e);
+          }
+          return nativeSuccess.call(this, resp, ...more);
+        },
+      });
+      return original.call(this, observed, ...rest);
+    };
+  }
 
+  // Gated Pass-Through: Torn's own syncTimeWithServer sends the request, with
+  // window.getAction wrapped only for the duration of that synchronous call.
+  // A scoped wrap cannot be overwritten by a later `function getAction`
+  // declaration, and it never sees any other getAction call.
+  function passThroughToNative() {
+    const original = window.getAction;
+    if (typeof original !== "function") {
+      // getAction is not a window property (e.g. top-level let/const), so it
+      // cannot be observed. Stay exactly native: the window never fills, so
+      // every native trigger passes through unwrapped.
+      log("window.getAction not found; passing through unobserved");
+      nativeSync.call(service);
+      return;
+    }
+    window.getAction = observingGetAction(original);
+    try {
+      nativeSync.call(service);
+    } finally {
+      window.getAction = original;
+    }
+  }
+
+  function sampleIfDue() {
+    if (inFlight) return;
+    const due =
+      verifyPending ||
+      samples.length === 0 ||
+      Date.now() >= samples[samples.length - 1].atWall + pollMs;
+    if (!due) return;
     const sh = readShared();
     if (
       sh?.attemptBy &&
@@ -288,68 +363,27 @@
       Math.abs(Date.now() - sh.attemptAtWall) < CONFIG.attemptGuardMs
     ) {
       log("another tab is sampling; deferring"); // Attempt Guard
-      return settle();
+      return;
     }
-
-    inFlight = true;
-    updateShared((o) => {
-      o.attemptAtWall = Date.now();
-      o.attemptBy = tabId;
-    });
-
-    const controller =
-      typeof AbortController === "function" ? new AbortController() : null;
-    const timeout =
-      controller &&
-      setTimeout(() => {
-        controller.abort();
-      }, CONFIG.fetchTimeoutMs);
-    const t0 = performance.now();
-
-    fetch(`/sidebarAjaxAction.php?action=servertime&t=${Date.now()}`, {
-      credentials: "same-origin",
-      signal: controller?.signal,
-    })
-      .then((resp) => resp.text())
-      .then((text) => {
-        const t3 = performance.now();
-        const data = JSON.parse(text);
-        if (!data || !Number.isFinite(data.time))
-          throw new Error("bad servertime payload");
-        const rtt = t3 - t0;
-        addSample({ offset: data.time + rtt / 2 - t3, rtt: rtt, atPerf: t3 });
-      })
-      .catch((e) => {
-        log("sample failed", e);
-      })
-      .finally(() => {
-        if (timeout) clearTimeout(timeout);
-        inFlight = false;
-        settle();
-      });
+    passThroughToNative();
   }
 
-  function startBurst() {
-    if (burstRemaining > 0) return;
-    burstRemaining = CONFIG.burstCount;
-    takeSample();
-  }
-
-  function clearWindowAndBurst() {
+  // Empties the window; it refills one Sample per native Sync Trigger.
+  function clearWindow() {
     samples = [];
     pollMs = CONFIG.minPollMs;
     updateShared((o) => {
       o.samples = [];
       o.pollMs = pollMs;
     });
-    startBurst();
   }
 
   // Timebase Anomaly: our perf clock paused (sleep) or the wall clock stepped.
   // Don't destroy the shared window blindly — another tab may already have
   // rebuilt it after the same discontinuity. Adopt fresh shared Samples and
-  // verify with one request; Burst only if nothing fresh exists. The
-  // verification is backed by the self-heal rule in addSample.
+  // verify with one Sample at the next native Sync Trigger; clear the window
+  // only if nothing fresh exists. The verification is backed by the self-heal
+  // rule in addSample.
   function handleTimebaseAnomaly() {
     log("timebase anomaly: resynchronizing");
     slewCorrection = null;
@@ -369,18 +403,16 @@
     if (samples.length) {
       pollMs = CONFIG.minPollMs;
       recomputeFromWindow();
-      takeSample(); // verification Sample
+      verifyPending = true;
     } else {
       lastWallPerfDelta = wallPerfDelta();
-      clearWindowAndBurst();
+      clearWindow();
     }
   }
 
-  // Every native Sync Trigger (focus listener, 120s interval, 20s post-load
-  // kick) lands here, as do visibility and storage events; the Poll Interval
-  // decides whether a Sample is actually taken.
-  function patchedSync() {
-    if (document.hidden) return;
+  // Local work only: anomaly detection and merging the shared window. Never
+  // causes a request, so any event may call it.
+  function refreshFromShared() {
     if (
       lastWallPerfDelta !== null &&
       Math.abs(wallPerfDelta() - lastWallPerfDelta) > CONFIG.wallDeltaAnomalyMs
@@ -389,31 +421,43 @@
       return;
     }
     if (mergeFromShared()) recomputeFromWindow();
-    if (samples.length === 0) {
-      startBurst();
-    } else if (Date.now() >= samples[samples.length - 1].atWall + pollMs) {
-      takeSample();
-    }
+  }
+
+  // Replaces syncTimeWithServer, so every native Sync Trigger (constructor
+  // call, focus listener, 120s interval, 20s post-load kick) lands here. Only
+  // these triggers may let a request through; the Poll Interval decides.
+  function patchedSync() {
+    if (document.hidden) return;
+    refreshFromShared();
+    sampleIfDue();
   }
 
   // --- patch application ---------------------------------------------------
-  function apply(service) {
-    fallbackAnchor = { timeNow: service.timeNow, perf: performance.now() };
+  function apply(svc) {
+    service = svc;
+    nativeSync = svc.syncTimeWithServer;
+    nativeTimeNow = svc.timeNow;
 
-    service.syncTimeWithServer = patchedSync;
-    Object.defineProperty(service, "timeNow", {
+    svc.syncTimeWithServer = patchedSync;
+    Object.defineProperty(svc, "timeNow", {
       configurable: true,
       get: serverNow,
-      set: () => {}, // writes ignored by design: the worker tick += 1000 must not drift the clock
+      // Before the first Sample, writes keep native behavior (the response to
+      // the constructor's request, the worker tick). After it, writes are
+      // ignored by design: the worker tick += 1000 must not drift the clock.
+      set: (v) => {
+        if (targetOffset === null && Number.isFinite(v)) nativeTimeNow = v;
+      },
     });
 
+    // Prompt refresh on our own events; correctness never depends on them
+    // (PDA webviews may not deliver storage events), and they never request.
     document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) patchedSync();
+      if (!document.hidden) refreshFromShared();
     });
-    // Prompt refresh when another tab writes; correctness never depends on
-    // this event (PDA webviews may not deliver it) — every trigger re-reads.
     window.addEventListener("storage", (e) => {
-      if (e && e.key === CONFIG.storageKey) patchedSync();
+      if (e && e.key === CONFIG.storageKey && !document.hidden)
+        refreshFromShared();
     });
 
     window.__timeSync = {
@@ -435,16 +479,16 @@
       },
     };
 
-    patchedSync(); // adopt the shared window if fresh; Burst only if it isn't
+    refreshFromShared(); // adopt the shared window; the next native trigger samples if due
     log("patched serverTimeService, tab", tabId);
   }
 
   // Torn PDA gives no injection-order guarantee relative to base.js, so wait
   // for the service to exist rather than assuming it does.
   (function waitForService(deadline) {
-    const service = window.serverTimeService;
-    if (service && typeof service.syncTimeWithServer === "function") {
-      apply(service);
+    const svc = window.serverTimeService;
+    if (svc && typeof svc.syncTimeWithServer === "function") {
+      apply(svc);
     } else if (performance.now() < deadline) {
       setTimeout(() => {
         waitForService(deadline);

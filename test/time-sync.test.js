@@ -3,19 +3,61 @@ import { createWorld } from "./harness.js";
 
 const LONG = 30000; // real-time budget for multi-hour virtual scenarios
 
-test("startup burst converges within 150ms using ~4 requests", async () => {
+// Startup bounds below are the worst case over a 20-seed sweep of the spiky
+// network model, rounded up.
+test("a cold start keeps the native clock until the 20s kick, then syncs", async () => {
   const w = createWorld({ seed: 1 });
   const t1 = w.makeTab("t1");
-  await w.advance(20000);
-  expect(Math.abs(t1.err())).toBeLessThan(150);
-  expect(w.fetchCount).toBeGreaterThanOrEqual(3);
-  expect(w.fetchCount).toBeLessThanOrEqual(5);
+  await w.advance(19000);
+  // native single-sample clock with 1s worker ticks (worst seen 656ms)
+  expect(Math.abs(t1.err())).toBeLessThan(1000);
+  await w.advance(6000);
+  expect(Math.abs(t1.err())).toBeLessThan(250);
+  expect(w.requestCount).toBe(2); // constructor call + 20s kick, as native
+  await w.advance(275000);
+  expect(Math.abs(t1.err())).toBeLessThan(100);
+});
+
+test("never sends a request outside a native Sync Trigger", async () => {
+  const w = createWorld({ seed: 13 });
+  const t1 = w.makeTab("t1");
+  await w.advance(60000);
+  const t2 = w.makeTab("t2", { intervalOffset: 7000 });
+  await w.advance(60000);
+  w.failNextPayload();
+  t1.setHidden(true);
+  await w.advance(1000);
+  w.systemSleep(3600000);
+  t1.setHidden(false);
+  t2.setHidden(true);
+  t2.setHidden(false);
+  await w.advance(3600000);
+  expect(w.requestsOutsideTrigger).toBe(0);
+});
+
+test("an unobservable getAction falls back to exact native behavior", async () => {
+  const w = createWorld({ seed: 15 });
+  const t1 = w.makeTab("t1", { getActionOffWindow: true });
+  await w.advance(30 * 60 * 1000);
+  expect(t1.win.__timeSync.state.samples.length).toBe(0);
+  // constructor + 20s kick + 15 interval ticks: every native request goes out
+  expect(w.requestCount).toBe(17);
+  expect(Math.abs(t1.err())).toBeLessThan(1500); // native single-sample clock
+});
+
+test("getAction is wrapped only during the native call", async () => {
+  const w = createWorld({ seed: 14 });
+  const t1 = w.makeTab("t1");
+  const native = t1.win.getAction;
+  await w.advance(25000);
+  expect(t1.win.getAction).toBe(native);
+  expect(t1.win.__timeSync.state.samples.length).toBe(1);
 });
 
 test("worker tick writes to timeNow are ignored", async () => {
   const w = createWorld({ seed: 2 });
   const t1 = w.makeTab("t1");
-  await w.advance(20000);
+  await w.advance(25000); // after the first Sample; before it, native semantics hold
   const before = t1.service.timeNow;
   t1.service.timeNow += 1000; // what timers_web_worker.js does every second
   expect(Math.abs(t1.service.timeNow - before)).toBeLessThan(5);
@@ -26,7 +68,7 @@ test(
   async () => {
     const w = createWorld({ seed: 3 });
     const t1 = w.makeTab("t1");
-    await w.advance(20000);
+    await w.advance(25000);
     let last = t1.service.timeNow,
       maxJump = 0,
       monotonic = true;
@@ -45,17 +87,18 @@ test(
 );
 
 // Rate/accuracy bounds are the worst case observed sweeping 20 seeds through the
-// spiky network model (8.75 req/h, 207ms), rounded up — not typical values, which
-// are ~4 req/h and tens of ms. Native behavior is 30 req/h per tab, stepping.
+// spiky network model (10 req/h, 73ms one tab; 8 req/h, 162ms two tabs), rounded
+// up — not typical values, which are ~4 req/h and tens of ms. Native behavior is
+// 30 req/h per tab, stepping.
 test(
   "polling backs off in steady state without losing accuracy",
   async () => {
     const w = createWorld({ seed: 4 });
     const t1 = w.makeTab("t1");
-    await w.advance(20000);
-    const f0 = w.fetchCount;
+    await w.advance(25000);
+    const f0 = w.requestCount;
     await w.advance(4 * 3600 * 1000);
-    expect((w.fetchCount - f0) / 4).toBeLessThanOrEqual(10);
+    expect((w.requestCount - f0) / 4).toBeLessThanOrEqual(10);
     expect(Math.abs(t1.err())).toBeLessThan(250);
   },
   LONG,
@@ -66,7 +109,7 @@ test(
   async () => {
     const w = createWorld({ seed: 5 });
     const t1 = w.makeTab("t1");
-    await w.advance(20000);
+    await w.advance(25000);
     w.failNextPayload(); // native code sets timeNow = NaN on this
     await w.advance(25 * 60 * 1000);
     expect(Number.isFinite(t1.service.timeNow)).toBe(true);
@@ -75,14 +118,15 @@ test(
   LONG,
 );
 
-test("a second tab adopts the shared window with zero requests", async () => {
+// The one request is the native constructor call, which runs before any patch.
+test("a second tab adopts the shared window without a Sample of its own", async () => {
   const w = createWorld({ seed: 6 });
   w.makeTab("t1");
   await w.advance(60000);
-  const before = w.fetchCount;
+  const before = w.requestCount;
   const t2 = w.makeTab("t2", { intervalOffset: 7000 });
   await w.advance(10000);
-  expect(w.fetchCount - before).toBeLessThanOrEqual(1);
+  expect(w.requestCount - before).toBeLessThanOrEqual(1);
   expect(Math.abs(t2.err())).toBeLessThan(150);
 });
 
@@ -104,9 +148,9 @@ test(
     const t1 = w.makeTab("t1");
     const t2 = w.makeTab("t2", { intervalOffset: 7000 });
     await w.advance(60000);
-    const f0 = w.fetchCount;
+    const f0 = w.requestCount;
     await w.advance(4 * 3600 * 1000);
-    expect((w.fetchCount - f0) / 4).toBeLessThanOrEqual(10); // combined, vs native 60 req/h
+    expect((w.requestCount - f0) / 4).toBeLessThanOrEqual(10); // combined, vs native 60 req/h
     expect(Math.abs(t1.err())).toBeLessThan(250);
     expect(Math.abs(t2.err())).toBeLessThan(250);
   },
@@ -125,7 +169,7 @@ test("both tabs recover from system sleep, second tab adopting the rebuild", asy
   await w.advance(1000);
   w.systemSleep(3600000); // perf clocks stand still for an hour
 
-  const f0 = w.fetchCount;
+  const f0 = w.requestCount;
   t1.setHidden(false);
   await w.advance(15000);
   t2.setHidden(false);
@@ -133,8 +177,8 @@ test("both tabs recover from system sleep, second tab adopting the rebuild", asy
 
   expect(Math.abs(t1.err())).toBeLessThan(200);
   expect(Math.abs(t2.err())).toBeLessThan(200);
-  // t1's anomaly Burst rebuilds the window; t2 adopts it + one verification sample
-  expect(w.fetchCount - f0).toBeLessThanOrEqual(7);
+  // t1's focus trigger rebuilds the window; t2 adopts it + one verification sample
+  expect(w.requestCount - f0).toBeLessThanOrEqual(2);
 });
 
 test(
@@ -164,11 +208,12 @@ test("broken localStorage degrades to per-tab operation", async () => {
   const w = createWorld({ seed: 11 });
   const t1 = w.makeTab("t1");
   await w.advance(60000);
-  const f0 = w.fetchCount;
+  const f0 = w.requestCount;
   const t3 = w.makeTab("t3", { broken: true, intervalOffset: 13000 });
-  await w.advance(20000);
-  expect(Math.abs(t3.err())).toBeLessThan(150);
-  expect(w.fetchCount - f0).toBeGreaterThanOrEqual(3); // its own burst
+  await w.advance(25000);
+  expect(Math.abs(t3.err())).toBeLessThan(250);
+  // constructor call + 20s kick: with no shared window, its own Sample is due
+  expect(w.requestCount - f0).toBe(2);
   expect(Math.abs(t1.err())).toBeLessThan(200); // healthy tab unaffected
 });
 
@@ -176,6 +221,6 @@ test("gives up quietly when serverTimeService never appears", async () => {
   const w = createWorld({ seed: 12 });
   const t = w.makeTab("t1", { noService: true });
   await w.advance(40000); // past the 30s wait-for-service deadline
-  expect(w.fetchCount).toBe(0);
+  expect(w.requestCount).toBe(0);
   expect(t.win.__timeSync).toBeUndefined();
 });

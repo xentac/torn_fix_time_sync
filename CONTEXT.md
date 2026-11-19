@@ -25,8 +25,8 @@ window.
 **Clock Filter** — the discipline of keeping a window of recent Samples and trusting the
 minimum-RTT one, rather than the newest or the average.
 
-**Burst** — several Samples taken in quick succession to seed or re-seed the Clock
-Filter, used at startup and after the Local Timebase may have paused (e.g. sleep).
+**Burst** — retired in D12. Several Samples taken in quick succession on the script's
+own timer. The script no longer sends requests of its own, so it cannot Burst.
 
 **Slew** — correcting displayed time gradually so no observer sees it jump. Used for
 small corrections.
@@ -37,9 +37,14 @@ to Slew.
 **Poll Interval** — the effective time between Samples in steady state. Adaptive: it
 backs off while the Filtered Offset is stable and shrinks when dispersion rises.
 
-**Sync Trigger** — any event that requests a sync: window focus, the periodic timer, or
-page load. Triggers *request* Samples; the Poll Interval decides whether one is actually
-taken.
+**Sync Trigger** — a native call of `syncTimeWithServer` by Torn's own code: the
+constructor call, window focus, the 120s interval, or the 20s post-load kick. Triggers
+*request* Samples; the Poll Interval decides whether one is actually taken. The script's
+own events (visibility, storage) are not Sync Triggers and never cause a request.
+
+**Gated Pass-Through** — the rule that every request is Torn's own: a native Sync
+Trigger either runs the native `syncTimeWithServer` unchanged, or does nothing. The
+script observes the response through a scoped wrap of `getAction`.
 
 **Wall Anchoring** — expressing a Sample relative to the shared wall clock (`Date.now()`)
 instead of a tab's private monotonic clock, so the Sample is meaningful in every tab.
